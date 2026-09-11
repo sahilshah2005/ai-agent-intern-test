@@ -264,3 +264,28 @@ class TestDetectConflicts:
         conflicts = detect_conflicts([chunk_superseded, chunk_active])
         # Superseded is not active, so no conflict flagged
         assert len(conflicts) == 0
+
+    def test_detects_return_window_conflict(self):
+        """Contradictory return window statements trigger conflict."""
+        chunk_a = self._make_chunk("docA.md", "Returns", "Customers have 30 calendar days to return.")
+        chunk_b = self._make_chunk("docB.md", "Returns", "Customers have 45 calendar days to return.")
+        conflicts = detect_conflicts([chunk_a, chunk_b])
+        assert len(conflicts) == 1
+        assert "return window" in conflicts[0][2]
+
+    def test_detects_warranty_conflict(self):
+        """Contradictory warranty statements trigger conflict."""
+        chunk_a = self._make_chunk("docA.md", "Warranty", "We offer a lifetime warranty on all bags.")
+        chunk_b = self._make_chunk("docB.md", "Warranty", "Aster & Row does not offer a lifetime warranty.")
+        conflicts = detect_conflicts([chunk_a, chunk_b])
+        assert len(conflicts) == 1
+        assert "warranty period" in conflicts[0][2]
+
+    def test_detects_return_fee_conflict(self):
+        """Contradictory return shipping fee statements trigger conflict."""
+        chunk_a = self._make_chunk("docA.md", "Shipping", "Enjoy a free domestic return label.")
+        chunk_b = self._make_chunk("docB.md", "Shipping", "A $6.95 return shipping fee applies.")
+        conflicts = detect_conflicts([chunk_a, chunk_b])
+        assert len(conflicts) == 1
+        assert "return shipping fee" in conflicts[0][2]
+

@@ -19,6 +19,7 @@ prepends a clear warning and the system prompt instructs the LLM to surface it.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -36,15 +37,57 @@ from kb_loader import Chunk, load_chunks, parse_frontmatter, split_by_headings  
 from scoring import compute_precedence_score  # re-export for tests
 
 # ---------------------------------------------------------------------------
-# Conflict detection
+# Conflict detection (generalized pattern-based)
 # ---------------------------------------------------------------------------
 
-# Pairs of contradictory keyword sets. A conflict is flagged when one chunk
-# matches set A and another (from a different file) matches set B.
-_CONFLICT_KEYWORD_PAIRS: list[tuple[frozenset[str], frozenset[str]]] = [
-    (
-        frozenset({"dishwasher safe", "dishwasher"}),          # doc 12 claims
-        frozenset({"hand-wash", "hand wash", "hand-washed"}),  # doc 11 claims
+# Each ConflictPattern defines a topic and pairs of contradictory value sets.
+# A conflict is flagged when two active+official chunks from DIFFERENT files
+# each contain text matching opposite sides of a value pair.
+# Internal/draft documents NEVER create customer-facing conflicts.
+
+@dataclass
+class ConflictPattern:
+    """Defines contradictory value pairs within a topic area."""
+    topic: str
+    value_pairs: list[tuple[frozenset[str], frozenset[str]]]
+
+
+_CONFLICT_PATTERNS: list[ConflictPattern] = [
+    ConflictPattern(
+        topic="cleaning/care",
+        value_pairs=[
+            (
+                frozenset({"dishwasher safe", "dishwasher"}),
+                frozenset({"hand-wash", "hand wash", "hand-washed"}),
+            ),
+        ],
+    ),
+    ConflictPattern(
+        topic="return window",
+        value_pairs=[
+            (
+                frozenset({"30 calendar days", "30 days"}),
+                frozenset({"45 calendar days", "45 days"}),
+            ),
+        ],
+    ),
+    ConflictPattern(
+        topic="warranty period",
+        value_pairs=[
+            (
+                frozenset({"lifetime warranty"}),
+                frozenset({"no lifetime warranty", "does not offer a lifetime"}),
+            ),
+        ],
+    ),
+    ConflictPattern(
+        topic="return shipping fee",
+        value_pairs=[
+            (
+                frozenset({"free return", "free domestic return label"}),
+                frozenset({"$6.95", "return shipping fee"}),
+            ),
+        ],
     ),
 ]
 
@@ -54,6 +97,10 @@ def detect_conflicts(
 ) -> list[tuple[dict, dict, str]]:
     """
     Detect genuine conflicts between active+official chunks from different files.
+
+    Only active + official documents participate in conflict detection.
+    Internal, draft, and superseded documents cannot create customer-facing
+    policy conflicts.
 
     Returns a list of (chunk_a, chunk_b, description) triples.
     """
@@ -72,27 +119,29 @@ def detect_conflicts(
             text_a = (chunk_a["heading"] + " " + chunk_a["content"]).lower()
             text_b = (chunk_b["heading"] + " " + chunk_b["content"]).lower()
 
-            for kw_a, kw_b in _CONFLICT_KEYWORD_PAIRS:
-                a_matches = any(kw in text_a for kw in kw_a)
-                b_matches = any(kw in text_b for kw in kw_b)
+            for pattern in _CONFLICT_PATTERNS:
+                for kw_a, kw_b in pattern.value_pairs:
+                    a_matches = any(kw in text_a for kw in kw_a)
+                    b_matches = any(kw in text_b for kw in kw_b)
 
-                if a_matches and b_matches:
-                    # Avoid duplicate pairs (order-independent)
-                    already = any(
-                        c[0]["filename"] == chunk_b["filename"]
-                        and c[1]["filename"] == chunk_a["filename"]
-                        for c in conflicts
-                    )
-                    if already:
-                        continue
+                    if a_matches and b_matches:
+                        # Avoid duplicate pairs (order-independent)
+                        already = any(
+                            c[0]["filename"] == chunk_b["filename"]
+                            and c[1]["filename"] == chunk_a["filename"]
+                            for c in conflicts
+                        )
+                        if already:
+                            continue
 
-                    desc = (
-                        f"Conflict between active official sources: "
-                        f"'{chunk_b['filename']}' ({chunk_b['heading']}) "
-                        f"and '{chunk_a['filename']}' ({chunk_a['heading']}) "
-                        f"provide contradictory guidance on the same topic."
-                    )
-                    conflicts.append((chunk_b, chunk_a, desc))
+                        desc = (
+                            f"Conflict ({pattern.topic}) between active "
+                            f"official sources: "
+                            f"'{chunk_b['filename']}' ({chunk_b['heading']}) "
+                            f"and '{chunk_a['filename']}' ({chunk_a['heading']}) "
+                            f"provide contradictory guidance."
+                        )
+                        conflicts.append((chunk_b, chunk_a, desc))
 
     return conflicts
 
@@ -266,3 +315,120 @@ class KnowledgeRetriever:
             parts.append(chunk_text)
 
         return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Hybrid retriever (vector + lexical with RRF)
+# ---------------------------------------------------------------------------
+
+
+class HybridRetriever:
+    """
+    Combines vector and lexical retrieval using Reciprocal Rank Fusion (RRF).
+
+    RRF formula: score(d) = 1/(k + rank_vector(d)) + 1/(k + rank_lexical(d))
+
+    After RRF, applies existing metadata precedence re-ranking.
+    Falls back to vector-only if lexical retrieval returns no results.
+    """
+
+    def __init__(self, rebuild_index: bool = False) -> None:
+        self._vector_retriever = KnowledgeRetriever()
+        if rebuild_index:
+            self._vector_retriever.rebuild()
+
+        # Build lexical index from the same chunks
+        from lexical import LexicalRetriever as _LexicalRetriever
+        chunks = load_chunks()
+        self._lexical_retriever = _LexicalRetriever(chunks)
+
+    def retrieve(
+        self, query: str, top_k: int = TOP_K
+    ) -> list[dict[str, Any]]:
+        """
+        Hybrid retrieval combining vector and lexical results via RRF.
+
+        Each result includes retrieval metadata:
+          - retrieval_method: "hybrid", "vector", or "lexical"
+          - vector_rank / lexical_rank: position in each ranker
+          - rrf_score: reciprocal rank fusion score
+        """
+        from config import RRF_K
+
+        # Get candidates from both retrievers
+        vector_results = self._vector_retriever.retrieve(
+            query, top_k=TOP_K_CANDIDATES
+        )
+        lexical_results = self._lexical_retriever.search(
+            query, top_k=TOP_K_CANDIDATES
+        )
+
+        if not lexical_results:
+            # Fall back to vector-only
+            for r in vector_results[:top_k]:
+                r["retrieval_method"] = "vector"
+                r["vector_rank"] = vector_results.index(r) + 1
+                r["lexical_rank"] = None
+                r["rrf_score"] = r["combined_score"]
+            return vector_results[:top_k]
+
+        # Build RRF scores
+        # Key: (filename, heading) to identify unique chunks
+        def _chunk_key(r: dict) -> str:
+            return f"{r['filename']}::{r['heading']}"
+
+        vector_ranks: dict[str, int] = {}
+        vector_data: dict[str, dict] = {}
+        for rank, r in enumerate(vector_results, start=1):
+            key = _chunk_key(r)
+            vector_ranks[key] = rank
+            vector_data[key] = r
+
+        lexical_ranks: dict[str, int] = {}
+        lexical_data: dict[str, dict] = {}
+        for rank, r in enumerate(lexical_results, start=1):
+            key = _chunk_key(r)
+            lexical_ranks[key] = rank
+            lexical_data[key] = r
+
+        # Union of all candidate keys
+        all_keys = set(vector_ranks) | set(lexical_ranks)
+
+        fused: list[dict[str, Any]] = []
+        for key in all_keys:
+            v_rank = vector_ranks.get(key)
+            l_rank = lexical_ranks.get(key)
+
+            rrf = 0.0
+            if v_rank is not None:
+                rrf += 1.0 / (RRF_K + v_rank)
+            if l_rank is not None:
+                rrf += 1.0 / (RRF_K + l_rank)
+
+            # Use the richer data source (vector has more metadata)
+            base = vector_data.get(key) or lexical_data.get(key)
+            if base is None:
+                continue
+
+            result = dict(base)
+            result["retrieval_method"] = "hybrid"
+            result["vector_rank"] = v_rank
+            result["lexical_rank"] = l_rank
+            result["rrf_score"] = round(rrf, 6)
+
+            # Combined score = RRF + precedence for final ranking
+            precedence = result.get("precedence_score", 0.0)
+            result["combined_score"] = round(rrf + precedence, 6)
+
+            fused.append(result)
+
+        fused.sort(key=lambda r: r["combined_score"], reverse=True)
+        return fused[:top_k]
+
+    def rebuild(self) -> None:
+        """Rebuild both indexes."""
+        self._vector_retriever.rebuild()
+        from lexical import LexicalRetriever as _LexicalRetriever
+        chunks = load_chunks()
+        self._lexical_retriever = _LexicalRetriever(chunks)
+

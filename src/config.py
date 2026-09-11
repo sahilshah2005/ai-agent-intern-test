@@ -35,6 +35,14 @@ EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"   # local, ~90 MB, no API key needed
 TOP_K: int = 5                                # final chunks sent to model
 TOP_K_CANDIDATES: int = 15                   # over-fetch before re-ranking
 
+# Hybrid retrieval
+RRF_K: int = 60                              # reciprocal rank fusion constant
+LEXICAL_TOP_K: int = 15                      # candidates from lexical retriever
+
+# Confidence thresholds
+CONFIDENCE_HIGH_THRESHOLD: float = 0.70
+CONFIDENCE_MEDIUM_THRESHOLD: float = 0.40
+
 # Metadata-based score adjustments (added to / subtracted from cosine similarity)
 AUTHORITY_BONUS: float = 0.25   # active + official + customer-facing
 LEGACY_PENALTY: float = 0.35    # status == superseded
