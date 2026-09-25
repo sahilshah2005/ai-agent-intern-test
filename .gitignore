@@ -38,3 +38,6 @@ build/
 
 # Logs
 *.log
+
+# Local end-to-end evaluations may contain scenario details and model usage
+evaluation/results*.json

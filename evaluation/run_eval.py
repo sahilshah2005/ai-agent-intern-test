@@ -33,9 +33,11 @@ Does not rely exclusively on an LLM judge.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -271,11 +273,20 @@ def run_case(agent: SupportAgent, case: dict, verbose: bool = False) -> dict:
         "tool_calls": [],
         "handoff": False,
     }
+    turn_latencies: list[float] = []
+    usage = {"prompt_tokens": 0, "completion_tokens": 0,
+             "api_calls": 0, "unreported_calls": 0}
 
     # Run each user turn in sequence (same session)
     for msg in messages:
         if msg.get("role") == "user":
-            last_result = agent.chat(msg["content"])
+            started = time.perf_counter()
+            try:
+                last_result = agent.chat(msg["content"])
+            finally:
+                turn_latencies.append(time.perf_counter() - started)
+            for key in usage:
+                usage[key] += last_result.get("token_usage", {}).get(key, 0)
 
     response = last_result["response"]
     sources = last_result["sources"]
@@ -341,6 +352,9 @@ def run_case(agent: SupportAgent, case: dict, verbose: bool = False) -> dict:
         "retrieved": retrieved,
         "tool_calls": tool_calls,
         "handoff": handoff,
+        "latency_seconds": sum(turn_latencies),
+        "turn_latencies_seconds": turn_latencies,
+        "token_usage": usage,
     }
 
 
@@ -394,6 +408,52 @@ def _print_summary(results: list[dict], suite_name: str) -> None:
     print(f"{'─' * 60}")
 
 
+def build_report(results: list[dict], input_price: float | None = None,
+                 output_price: float | None = None) -> dict:
+    """Summarise case assertions and observed calls without storing customer text."""
+    passed = sum(r["passed"] for r in results)
+    latencies = sorted(t for r in results for t in r.get("turn_latencies_seconds", []))
+
+    def percentile(p: float) -> float | None:
+        if not latencies:
+            return None
+        # Nearest-rank percentile, with the first observation at rank 1.
+        import math
+        return round(latencies[max(0, math.ceil(p * len(latencies)) - 1)], 3)
+
+    usage = {key: sum(r.get("token_usage", {}).get(key, 0) for r in results)
+             for key in ("prompt_tokens", "completion_tokens", "api_calls", "unreported_calls")}
+    categories: dict[str, dict[str, int]] = {}
+    for r in results:
+        cat = categories.setdefault(r["category"], {"passed": 0, "total": 0})
+        cat["total"] += 1
+        cat["passed"] += int(r["passed"])
+
+    report = {
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "cases": {"passed": passed, "total": len(results),
+                  "pass_rate": round(passed / len(results), 4) if results else None},
+        "by_category": categories,
+        "latency_seconds_per_turn": {
+            "count": len(latencies), "p50": percentile(0.5), "p95": percentile(0.95),
+        },
+        "token_usage": usage,
+        "failures": [{"id": r["id"], "category": r["category"],
+                      "assertions": r["failures"]} for r in results if not r["passed"]],
+    }
+    if input_price is not None and output_price is not None:
+        report["estimated_llm_cost_usd"] = (
+            round((usage["prompt_tokens"] * input_price +
+                   usage["completion_tokens"] * output_price) / 1_000_000, 6)
+            if not usage["unreported_calls"] else None
+        )
+        report["pricing_usd_per_million_tokens"] = {
+            "input": input_price, "output": output_price,
+        }
+    return report
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -408,7 +468,18 @@ def main() -> int:
         help="Which case files to run (default: all)",
     )
     parser.add_argument("--verbose", action="store_true", help="Show response excerpts")
+    parser.add_argument("--report-json", type=Path,
+                        help="Write a structured report (no full prompts or responses)")
+    parser.add_argument("--input-price-per-million", type=float,
+                        help="USD per million input tokens for the selected model")
+    parser.add_argument("--output-price-per-million", type=float,
+                        help="USD per million output tokens for the selected model")
     args = parser.parse_args()
+    prices = (args.input_price_per_million, args.output_price_per_million)
+    if (prices[0] is None) != (prices[1] is None):
+        parser.error("provide both input and output token prices, or neither")
+    if any(value is not None and value < 0 for value in prices):
+        parser.error("token prices must be non-negative")
 
     # Load case files
     suites: list[tuple[str, list[dict]]] = []
@@ -437,6 +508,7 @@ def main() -> int:
 
         for case in cases:
             print(f"  Running: {case['id']} ...", end="", flush=True)
+            case_started = time.perf_counter()
             try:
                 result = run_case(agent, case, verbose=args.verbose)
             except Exception as exc:  # noqa: BLE001
@@ -450,7 +522,10 @@ def main() -> int:
                     "retrieved": [],
                     "tool_calls": [],
                     "handoff": False,
+                    "turn_latencies_seconds": [],
+                    "token_usage": {},
                 }
+            result.setdefault("latency_seconds", time.perf_counter() - case_started)
             print(f"\r", end="")
             _print_result(result, args.verbose)
             suite_results.append(result)
@@ -464,6 +539,20 @@ def main() -> int:
         total = len(all_results)
         passed = sum(1 for r in all_results if r["passed"])
         print(f"  Total: {passed}/{total} cases passed\n")
+
+    report = build_report(all_results, *prices)
+    timing = report["latency_seconds_per_turn"]
+    print(f"  Per-turn latency: p50={timing['p50']}s, p95={timing['p95']}s "
+          f"({timing['count']} turns)")
+    print(f"  LLM usage: {report['token_usage']['prompt_tokens']} input + "
+          f"{report['token_usage']['completion_tokens']} output tokens "
+          f"({report['token_usage']['api_calls']} calls)")
+    if prices[0] is not None:
+        print(f"  Estimated LLM cost (USD): {report['estimated_llm_cost_usd']}")
+    if args.report_json:
+        args.report_json.parent.mkdir(parents=True, exist_ok=True)
+        args.report_json.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"  Report written to {args.report_json}")
 
     any_failed = any(not r["passed"] for r in all_results)
     return 1 if any_failed else 0

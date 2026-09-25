@@ -233,6 +233,8 @@ class SupportAgent:
         tool_calls_made: list[dict[str, Any]] = []
         tool_error = False
         response_text = ""
+        token_usage = {"prompt_tokens": 0, "completion_tokens": 0,
+                       "api_calls": 0, "unreported_calls": 0}
 
         try:
             first_response = self._client.chat.completions.create(
@@ -243,6 +245,7 @@ class SupportAgent:
                 temperature=0.1,
                 max_tokens=1000,
             )
+            self._record_usage(token_usage, first_response)
             choice = first_response.choices[0]
         except Exception as exc:
             trace("llm_error", {"error": str(exc)})
@@ -309,6 +312,7 @@ class SupportAgent:
                     temperature=0.1,
                     max_tokens=1000,
                 )
+                self._record_usage(token_usage, second_response)
                 response_text = second_response.choices[0].message.content or ""
             except Exception as exc:
                 trace("llm_error_second", {"error": str(exc)})
@@ -412,6 +416,7 @@ class SupportAgent:
                 "needs_retrieval": routing.needs_retrieval,
                 "needs_order_tool": routing.needs_order_tool,
             },
+            "token_usage": token_usage,
         }
 
     def reset(self) -> None:
@@ -421,6 +426,17 @@ class SupportAgent:
     # ------------------------------------------------------------------
     # Private helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _record_usage(totals: dict[str, int], response: Any) -> None:
+        """Count every successful LLM response, including a tool-call follow-up."""
+        totals["api_calls"] += 1
+        usage = getattr(response, "usage", None)
+        if usage is None or usage.prompt_tokens is None or usage.completion_tokens is None:
+            totals["unreported_calls"] += 1
+            return
+        totals["prompt_tokens"] += usage.prompt_tokens
+        totals["completion_tokens"] += usage.completion_tokens
 
     def _extract_sources(
         self, response: str, retrieved: list[dict[str, Any]]
@@ -489,4 +505,6 @@ class SupportAgent:
                 "needs_retrieval": routing.needs_retrieval if routing else False,
                 "needs_order_tool": routing.needs_order_tool if routing else False,
             },
+            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                            "api_calls": 0, "unreported_calls": 0},
         }
