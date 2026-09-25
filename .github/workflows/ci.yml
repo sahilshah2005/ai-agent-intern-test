@@ -27,12 +27,12 @@ jobs:
           pip install -r requirements.txt
           pip install ruff
 
-      - name: Lint with ruff
-        run: ruff check src/ tests/ evaluation/ cli.py
-
       - name: Run unit tests
         run: python -m pytest tests/ -v --tb=short
 
+      - name: Lint with ruff
+        run: ruff check src/ tests/ evaluation/ cli.py
+
       # Evaluation suite is skipped in CI because it requires
       # an OPENAI_API_KEY. Run it locally with:
-      #   python evaluation/run_eval.py --verbose
+      #   python evaluation/run_eval.py --cases all --report-json evaluation/results.json
